@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from llama_data import ConfigStore, LibraryStore, ProfileStore
+from llama_data import ConfigStore, LibraryStore, ProfileStore, UserOptionStore
 
 from .pages.dashboard import DashboardPage
 from .pages.diagnostics import DiagnosticsPage
@@ -99,11 +99,12 @@ class MainWindow(QMainWindow):
         # pre-Phase-11 scans are stripped and the file is saved at the
         # current schema version. No inline wipe here.
         profile_store = ProfileStore.default()
+        user_option_store = UserOptionStore.default()
 
         self._pages: dict[NavItemId, QWidget] = {
             NavItemId.LIBRARY: LibraryPage(library_store=library_store, profile_store=profile_store, config_store=config_store),
             NavItemId.DISCOVER: DiscoverPage(),
-            NavItemId.RUN: RunPage(config_store=config_store, library_store=library_store, profile_store=profile_store),
+            NavItemId.RUN: RunPage(config_store=config_store, library_store=library_store, profile_store=profile_store, user_option_store=user_option_store),
             NavItemId.SETTINGS: SettingsPage(),
             NavItemId.DASHBOARD: DashboardPage(),
             NavItemId.DIAGNOSTICS: DiagnosticsPage(),

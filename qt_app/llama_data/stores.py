@@ -6,7 +6,7 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, List, Optional
-from .models import AppConfig, LocalModel, ModelProfile, utc_now
+from .models import AppConfig, LocalModel, ModelProfile, UserOptions, utc_now
 from .paths import DataPaths, default_paths
 from .storage import FileLock, Migration, MigrationChain, VersionedEnvelope, current_version, load_envelope, resolve_version, save_envelope
 
@@ -216,4 +216,35 @@ class ProfileStore:
             self.save(profiles.values())
 
 
-__all__ = ["ConfigStore", "LibraryStore", "ProfileStore"]
+USER_OPTIONS_MIGRATIONS: dict[int, Migration] = {1: lambda payload: payload}
+_USER_OPTIONS_CHAIN = MigrationChain(migrations=USER_OPTIONS_MIGRATIONS, target=current_version())
+_USER_OPTIONS_WRITE_LOCK = threading.RLock()
+
+
+@dataclass
+class UserOptionStore:
+    """Persists user-added option selections (UI layout only)."""
+    paths: DataPaths
+
+    @classmethod
+    def default(cls) -> "UserOptionStore":
+        return cls(default_paths())
+
+    def load(self) -> UserOptions:
+        with _USER_OPTIONS_WRITE_LOCK:
+            envelope = load_envelope(self.paths.user_options_path)
+            if envelope is None:
+                return UserOptions()
+            data = resolve_version(envelope, _USER_OPTIONS_CHAIN)
+            return UserOptions.from_json(data)
+
+    def save(self, user_options: UserOptions) -> None:
+        with _USER_OPTIONS_WRITE_LOCK, FileLock(self.paths.user_options_path):
+            self.paths.ensure()
+            save_envelope(
+                self.paths.user_options_path,
+                VersionedEnvelope(current_version(), user_options.to_json()),
+            )
+
+
+__all__ = ["ConfigStore", "LibraryStore", "ProfileStore", "UserOptionStore"]

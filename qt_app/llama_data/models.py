@@ -203,4 +203,60 @@ class ModelProfile:
             user_set=user_set,
         )
 
-__all__ = ["AppConfig", "HfTokenSource", "LocalModel", "ModelProfile", "utc_now"]
+@dataclass
+class UserOptionEntry:
+    """A single user-added option: which flag and where to display it."""
+    flag: str           # canonical flag, e.g. "--mirostat"
+    destination: str    # "main" or group display name, e.g. "Sampling"
+
+    def to_json(self) -> dict[str, Any]:
+        return {"flag": self.flag, "destination": self.destination}
+
+    @classmethod
+    def from_json(cls, data: Any) -> "UserOptionEntry":
+        if not isinstance(data, dict):
+            raise ValueError("invalid UserOptionEntry")
+        return cls(
+            flag=str(data["flag"]),
+            destination=str(data["destination"]),
+        )
+
+
+@dataclass
+class UserOptions:
+    """Persisted set of user-added options (UI layout only, not values)."""
+    version: int = 1
+    options: list[UserOptionEntry] = field(default_factory=list)
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "options": [e.to_json() for e in self.options],
+        }
+
+    @classmethod
+    def from_json(cls, data: Any) -> "UserOptions":
+        if not isinstance(data, dict):
+            return cls()
+        raw_opts = data.get("options")
+        opts: list[UserOptionEntry] = []
+        if isinstance(raw_opts, list):
+            for item in raw_opts:
+                try:
+                    opts.append(UserOptionEntry.from_json(item))
+                except (TypeError, ValueError, KeyError):
+                    continue
+        return cls(version=int(data.get("version", 1)), options=opts)
+
+    def has_flag(self, flag: str) -> bool:
+        return any(e.flag == flag for e in self.options)
+
+    def add(self, flag: str, destination: str) -> None:
+        if not self.has_flag(flag):
+            self.options.append(UserOptionEntry(flag=flag, destination=destination))
+
+    def remove(self, flag: str) -> None:
+        self.options = [e for e in self.options if e.flag != flag]
+
+
+__all__ = ["AppConfig", "HfTokenSource", "LocalModel", "ModelProfile", "UserOptionEntry", "UserOptions", "utc_now"]

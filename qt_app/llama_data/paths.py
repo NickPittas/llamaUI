@@ -20,6 +20,7 @@ PROFILES_FILE = "profiles.json"
 LIBRARY_FILE = "library.json"
 CARDS_DIR = "cards"
 SCHEMA_CACHE_FILE = "schema_cache.json"
+USER_OPTIONS_FILE = "user_options.json"
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,7 @@ class DataPaths:
     library_path: Path
     cards_dir: Path
     schema_cache_path: Path
+    user_options_path: Path
 
     def ensure(self) -> None:
         """Create all directories this path set references."""
@@ -69,6 +71,7 @@ def default_paths(data_dir: Optional[Path] = None) -> DataPaths:
         library_path=root / LIBRARY_FILE,
         cards_dir=root / CARDS_DIR,
         schema_cache_path=root / SCHEMA_CACHE_FILE,
+        user_options_path=root / USER_OPTIONS_FILE,
     )
 
 
@@ -79,6 +82,7 @@ __all__ = [
     "LIBRARY_FILE",
     "CARDS_DIR",
     "SCHEMA_CACHE_FILE",
+    "USER_OPTIONS_FILE",
     "DataPaths",
     "default_data_dir",
     "default_paths",

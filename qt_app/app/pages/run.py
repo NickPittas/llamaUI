@@ -7,6 +7,7 @@ from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -26,7 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 
-from llama_data import ConfigStore, LibraryStore, ModelProfile, PROFILE_PRESETS, ProfileStore
+from llama_data import ConfigStore, LibraryStore, ModelProfile, PROFILE_PRESETS, ProfileStore, UserOptionStore
 from llama_data.llama_options import (
     LLAMA_OPTION_CATALOG,
     LlamaOption,
@@ -45,6 +46,7 @@ from ..services.runtime import LlamaServerController, ServerState, build_argv, g
 from ..services.runtime_api import LlamaServerApiClient
 from ..widgets.buttons import DangerButton, FilterPill, SecondaryButton, SuccessButton
 from ..widgets.cards import Card, CardTitle, ElidedLabel, FieldTile, OptionCard
+from ..widgets.collapsible import CollapsibleGroup
 from ..widgets.flow import FlowLayout
 from ..widgets.slider_spin import SliderDoubleSpinBox, SliderSpinBox
 from .base import PageBase
@@ -216,6 +218,230 @@ class _StopThread(QThread):
             self.failed.emit(str(exc))
 
 
+class _OptionPickerDialog(QDialog):
+    """Dialog for browsing and selecting llama-server options to add to the UI."""
+
+    def __init__(
+        self,
+        schema: RuntimeSchema | None,
+        existing_flags: set[str],
+        user_option_store: UserOptionStore,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Add Options")
+        self.setMinimumSize(700, 560)
+        self._schema = schema
+        self._existing_flags = existing_flags
+        self._user_option_store = user_option_store
+        # option flag → QCheckBox
+        self._checkboxes: dict[str, QCheckBox] = {}
+        # option flag → default destination group display name
+        self._default_destinations: dict[str, str] = {}
+        # option flag → RuntimeOption (for kind metadata)
+        self._rt_options: dict[str, RuntimeOption] = {}
+
+        self._build_ui()
+
+    def _available_group_names(self) -> list[str]:
+        """Return display names for all possible destination groups."""
+        names = []
+        for display in _GROUP_DISPLAY.values():
+            if display not in names:
+                names.append(display)
+        return names
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        if self._schema is None:
+            msg = QLabel(
+                "Configure a llama-server binary in Settings to browse available options.",
+                self,
+            )
+            msg.setObjectName("Muted")
+            msg.setWordWrap(True)
+            layout.addWidget(msg)
+            layout.addStretch(1)
+            close_btn = QPushButton("Close", self)
+            close_btn.clicked.connect(self.reject)
+            layout.addWidget(close_btn)
+            return
+
+        # Search box
+        self._search = QLineEdit(self)
+        self._search.setPlaceholderText("Search options\u2026")
+        self._search.setClearButtonEnabled(True)
+        self._search.textChanged.connect(self._apply_filter)
+        layout.addWidget(self._search)
+
+        # Scrollable option list
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll_widget = QWidget()
+        self._scroll_layout = QVBoxLayout(scroll_widget)
+        self._scroll_layout.setContentsMargins(0, 0, 0, 0)
+        self._scroll_layout.setSpacing(0)
+        self._build_option_groups(scroll_widget)
+        self._scroll_layout.addStretch(1)
+        scroll.setWidget(scroll_widget)
+        layout.addWidget(scroll, 1)
+
+        # Destination selector
+        dest_row = QHBoxLayout()
+        dest_row.setSpacing(8)
+        dest_label = QLabel("Add selected to:", self)
+        dest_label.setObjectName("Muted")
+        self._dest_combo = QComboBox(self)
+        self._dest_combo.addItem("Main Settings")
+        for name in self._available_group_names():
+            self._dest_combo.addItem(name)
+        dest_row.addWidget(dest_label)
+        dest_row.addWidget(self._dest_combo, 1)
+        layout.addLayout(dest_row)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        cancel_btn = QPushButton("Cancel", self)
+        cancel_btn.clicked.connect(self.reject)
+        self._add_btn = QPushButton("Add Selected", self)
+        self._add_btn.setDefault(True)
+        self._add_btn.clicked.connect(self._on_add)
+        self._add_btn.setEnabled(False)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(self._add_btn)
+        layout.addLayout(btn_row)
+
+        # Update add button count when checkboxes change
+        for cb in self._checkboxes.values():
+            cb.toggled.connect(self._update_add_button)
+
+    def _build_option_groups(self, parent: QWidget) -> None:
+        """Build collapsible groups of available options."""
+        available = self._available_options()
+        if not available:
+            msg = QLabel("All available options are already in the UI.", parent)
+            msg.setObjectName("Muted")
+            self._scroll_layout.addWidget(msg)
+            return
+
+        # Group by display group name
+        groups: dict[str, list[RuntimeOption]] = {}
+        for rt_opt in available:
+            display_group = _group_display(rt_opt.group)
+            groups.setdefault(display_group, []).append(rt_opt)
+
+        # Sort groups by display name for consistent order
+        for group_name in sorted(groups.keys()):
+            options = groups[group_name]
+            collapsible = CollapsibleGroup(
+                f"{group_name} ({len(options)})",
+                parent,
+                initially_expanded=False,
+            )
+            for rt_opt in options:
+                row = self._make_option_row(rt_opt, collapsible)
+                collapsible.add_widget(row)
+            self._scroll_layout.addWidget(collapsible)
+
+    def _available_options(self) -> list[RuntimeOption]:
+        """Return schema options not already in the UI or user-added."""
+        user_opts = self._user_option_store.load()
+        user_flags = {e.flag for e in user_opts.options}
+        result = []
+        for rt_opt in self._schema.options:
+            # Skip already-present curated options and already user-added
+            if rt_opt.flag in self._existing_flags:
+                continue
+            if rt_opt.flag in user_flags:
+                continue
+            # Skip boolean negations (--no-X when --X exists)
+            if rt_opt.flag.startswith("--no-") and rt_opt.flag[5:] in self._existing_flags:
+                continue
+            result.append(rt_opt)
+        return result
+
+    def _make_option_row(self, rt_opt: RuntimeOption, parent: QWidget) -> QWidget:
+        """Create a single option row with checkbox, flag, and description."""
+        row = QWidget(parent)
+        row.setProperty("option_flag", rt_opt.flag)
+        h = QHBoxLayout(row)
+        h.setContentsMargins(8, 4, 8, 4)
+        h.setSpacing(8)
+
+        cb = QCheckBox(row)
+        self._checkboxes[rt_opt.flag] = cb
+        self._default_destinations[rt_opt.flag] = _group_display(rt_opt.group)
+        self._rt_options[rt_opt.flag] = rt_opt
+
+        flag_label = QLabel(rt_opt.flag, row)
+        flag_label.setObjectName("MonoFlag")
+        flag_label.setMinimumWidth(180)
+
+        desc = rt_opt.description or ""
+        desc_label = QLabel(desc, row)
+        desc_label.setObjectName("Muted")
+        desc_label.setWordWrap(False)
+
+        h.addWidget(cb)
+        h.addWidget(flag_label)
+        h.addWidget(desc_label, 1)
+        return row
+
+    def _apply_filter(self, text: str) -> None:
+        """Show/hide option rows based on search text."""
+        query = text.strip().lower()
+        for i in range(self._scroll_layout.count()):
+            item = self._scroll_layout.itemAt(i)
+            if item is None or item.widget() is None:
+                continue
+            widget = item.widget()
+            if isinstance(widget, CollapsibleGroup):
+                visible_children = 0
+                for j in range(widget._body_layout.count()):
+                    child_item = widget._body_layout.itemAt(j)
+                    if child_item is None or child_item.widget() is None:
+                        continue
+                    child = child_item.widget()
+                    flag = child.property("option_flag") or ""
+                    desc = ""
+                    for lbl in child.findChildren(QLabel):
+                        if lbl.objectName() != "MonoFlag":
+                            desc = lbl.text().lower()
+                            break
+                    matches = not query or query in flag.lower() or query in desc
+                    child.setVisible(matches)
+                    if matches:
+                        visible_children += 1
+                widget.setVisible(visible_children > 0)
+                if query:
+                    widget.set_expanded(True)
+                widget.set_count(visible_children)
+
+    def _update_add_button(self) -> None:
+        count = sum(1 for cb in self._checkboxes.values() if cb.isChecked())
+        self._add_btn.setEnabled(count > 0)
+        self._add_btn.setText(f"Add Selected ({count})" if count else "Add Selected")
+
+    def _on_add(self) -> None:
+        """Store selected options and accept the dialog."""
+        dest = self._dest_combo.currentText()
+        user_opts = self._user_option_store.load()
+        added = 0
+        for flag, cb in self._checkboxes.items():
+            if cb.isChecked():
+                user_opts.add(flag, dest)
+                added += 1
+        if added:
+            self._user_option_store.save(user_opts)
+        self.accept()
+
+
 class RunPage(PageBase):
     inspector_changed = Signal(dict)
     def __init__(
@@ -223,11 +449,13 @@ class RunPage(PageBase):
         config_store: ConfigStore | None = None,
         library_store: LibraryStore | None = None,
         profile_store: ProfileStore | None = None,
+        user_option_store: UserOptionStore | None = None,
         parent=None,
     ):
         self.config_store = config_store or ConfigStore.default()
         self.library_store = library_store or LibraryStore.default()
         self.profile_store = profile_store or ProfileStore.default()
+        self.user_option_store = user_option_store or UserOptionStore.default()
         self.controller = LlamaServerController(on_log=None)
         self._models: list = []
         self._profiles: list = []
@@ -472,6 +700,46 @@ class RunPage(PageBase):
                 extras_row.addWidget(option_card)
             extras_row.addStretch(1)
             layout.addLayout(extras_row)
+        # User-added options for Main Settings
+        user_main_opts = self._user_added_options_for_destination("main")
+        if user_main_opts:
+            user_heading = QLabel("User options", card)
+            user_heading.setObjectName("CardTitle")
+            layout.addWidget(user_heading)
+            user_grid = QGridLayout()
+            user_grid.setHorizontalSpacing(12)
+            user_grid.setVerticalSpacing(8)
+            user_grid.setColumnStretch(0, 1)
+            user_grid.setColumnStretch(1, 1)
+            for idx, rt_opt in enumerate(user_main_opts):
+                catalog_opt = LLAMA_OPTION_CATALOG.get(rt_opt.id)
+                if catalog_opt is not None:
+                    option_card = OptionCard(
+                        label=catalog_opt.label,
+                        flag=catalog_opt.flag,
+                        importance=catalog_opt.importance,
+                        parent=card,
+                    )
+                    option_card.setToolTip(catalog_opt.help_text)
+                    widget = self._make_editor(catalog_opt, card)
+                else:
+                    option_card = OptionCard(
+                        label=rt_opt.label or rt_opt.flag,
+                        flag=rt_opt.flag,
+                        importance=0,
+                        parent=card,
+                    )
+                    option_card.setToolTip(rt_opt.description)
+                    widget = self._make_schema_editor(rt_opt, card)
+                self._editors[rt_opt.id] = widget
+                if rt_opt.id not in self._schema_options_by_id:
+                    self._schema_options_by_id[rt_opt.id] = rt_opt
+                option_card.add_editor(widget)
+                remove_btn = self._make_user_option_remove_button(rt_opt.flag, card)
+                option_card.add_editor(remove_btn)
+                row, col = divmod(idx, 2)
+                user_grid.addWidget(option_card, row, col)
+            layout.addLayout(user_grid)
         self._main_settings_card = card
         self._layout.addWidget(card)
 
@@ -500,9 +768,13 @@ class RunPage(PageBase):
         self.arg_search.textChanged.connect(self._apply_argument_filter)
         self.arg_filter_changed = FilterPill("Only changed", header_row)
         self.arg_filter_changed.toggled.connect(self._apply_argument_filter)
+        self._add_options_btn = SecondaryButton("Add Options\u2026", header_row)
+        self._add_options_btn.setToolTip("Browse all llama-server options and add to the UI")
+        self._add_options_btn.clicked.connect(self._open_option_picker)
         header_layout.addWidget(self._advanced_toggle_btn)
         header_layout.addWidget(self.arg_search)
         header_layout.addWidget(self.arg_filter_changed)
+        header_layout.addWidget(self._add_options_btn)
         # The body of the card — a wrapped-tab container whose tab bar
         # flows into multiple rows instead of scrolling horizontally.
         self._advanced_body = QWidget(card)
@@ -672,6 +944,10 @@ class RunPage(PageBase):
             scroll.setWidget(tab_page)
             tabs.addTab(scroll, "Raw extra args")
 
+        # Track tab pages by display name for user-option injection
+        # Maps display name → (tab_page, grid, next_row_idx)
+        self._tab_pages: dict[str, tuple[QWidget, QGridLayout, list[int]]] = {}
+
         for group_name in group_order:
             options = groups.get(group_name, [])
             if not options:
@@ -714,16 +990,105 @@ class RunPage(PageBase):
                 self._option_cards[rt_opt.id] = option_card
                 row, col = divmod(idx, 2)
                 grid.addWidget(option_card, row, col)
+            display = _group_display(group_name)
+            self._tab_pages[display] = (tab_page, grid, [len(options)])
             scroll = QScrollArea(tabs)
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QScrollArea.Shape.NoFrame)
             scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
             scroll.setWidget(tab_page)
-            tabs.addTab(scroll, _group_display(group_name))
+            tabs.addTab(scroll, display)
+
+        # Inject user-added options into existing or new tabs
+        self._inject_user_options_into_tabs(tabs)
+
+    def _inject_user_options_into_tabs(self, tabs: _WrappedTabs) -> None:
+        """Inject user-added options into existing or new advanced-group tabs."""
+        user_opts = self.user_option_store.load()
+        for entry in user_opts.options:
+            if entry.destination == "main":
+                continue  # handled in _build_main_settings
+            # Find the RuntimeOption
+            rt_opt = None
+            for opt in (self._schema.options if self._schema else []):
+                if opt.flag == entry.flag:
+                    rt_opt = opt
+                    break
+            if rt_opt is None:
+                # Create minimal entry for unsupported flag
+                rt_opt = RuntimeOption(
+                    id=f"user:{entry.flag}",
+                    flag=entry.flag,
+                    flags=[entry.flag],
+                    label=entry.flag,
+                    group="advanced",
+                    kind="string",
+                    description="(not supported by current binary)",
+                    supported=False,
+                    curated=False,
+                )
+            # Register in schema_options_by_id for profile loading
+            if rt_opt.id not in self._schema_options_by_id:
+                self._schema_options_by_id[rt_opt.id] = rt_opt
+
+            dest_display = entry.destination
+            tab_info = self._tab_pages.get(dest_display)
+            if tab_info is None:
+                # Create a new tab for this destination
+                tab_page = QWidget(tabs)
+                grid = QGridLayout(tab_page)
+                grid.setContentsMargins(8, 8, 8, 8)
+                grid.setHorizontalSpacing(10)
+                grid.setVerticalSpacing(8)
+                grid.setColumnStretch(0, 1)
+                grid.setColumnStretch(1, 1)
+                tab_page.setMinimumHeight(0)
+                tab_page.setMaximumHeight(16777215)
+                tab_page.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+                tab_info = (tab_page, grid, [0])
+                self._tab_pages[dest_display] = tab_info
+                scroll = QScrollArea(tabs)
+                scroll.setWidgetResizable(True)
+                scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+                scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+                scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+                scroll.setWidget(tab_page)
+                tabs.addTab(scroll, dest_display)
+
+            tab_page, grid, counter = tab_info
+            idx = counter[0]
+            catalog_opt = LLAMA_OPTION_CATALOG.get(rt_opt.id)
+            if catalog_opt is not None:
+                option_card = OptionCard(
+                    label=catalog_opt.label,
+                    flag=catalog_opt.flag,
+                    importance=catalog_opt.importance,
+                    parent=tab_page,
+                )
+                option_card.setToolTip(catalog_opt.help_text)
+                widget = self._make_editor(catalog_opt, tab_page)
+            else:
+                option_card = OptionCard(
+                    label=rt_opt.label or rt_opt.flag,
+                    flag=rt_opt.flag,
+                    importance=0,
+                    parent=tab_page,
+                )
+                option_card.setToolTip(rt_opt.description)
+                widget = self._make_schema_editor(rt_opt, tab_page)
+            self._editors[rt_opt.id] = widget
+            option_card.add_editor(widget)
+            remove_btn = self._make_user_option_remove_button(rt_opt.flag, tab_page)
+            option_card.add_editor(remove_btn)
+            self._option_cards[rt_opt.id] = option_card
+            row, col = divmod(idx, 2)
+            grid.addWidget(option_card, row, col)
+            counter[0] = idx + 1
 
     def _build_catalog_advanced(self, tabs: _WrappedTabs, handled: set[str]) -> None:
         """Build advanced groups from the static catalog (fallback)."""
+        self._tab_pages: dict[str, tuple[QWidget, QGridLayout, list[int]]] = {}
         for group in LLAMA_OPTION_CATALOG.groups_in_order():
             options = [o for o in LLAMA_OPTION_CATALOG.by_group(group) if o.id not in handled]
             if not options:
@@ -755,13 +1120,17 @@ class RunPage(PageBase):
                 self._option_cards[option.id] = option_card
                 row, col = divmod(idx, 2)
                 grid.addWidget(option_card, row, col)
+            display = _group_display(group)
+            self._tab_pages[display] = (tab_page, grid, [len(options)])
             scroll = QScrollArea(tabs)
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QScrollArea.Shape.NoFrame)
             scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
             scroll.setWidget(tab_page)
-            tabs.addTab(scroll, _group_display(group))
+            tabs.addTab(scroll, display)
+        # Inject user-added options
+        self._inject_user_options_into_tabs(tabs)
 
     def _build_logs(self) -> None:
         logs = Card(self._body)
@@ -794,6 +1163,138 @@ class RunPage(PageBase):
         self.logs.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         logs_layout.addWidget(self.logs)
         self._layout.addWidget(logs)
+
+    # ------------------------------------------------------------------
+    # User-added options
+    # ------------------------------------------------------------------
+
+    def _open_option_picker(self) -> None:
+        """Open the option picker dialog and rebuild UI if options were added."""
+        existing_flags = set()
+        for opt in LLAMA_OPTION_CATALOG:
+            existing_flags.add(opt.flag)
+            for alias in opt.aliases:
+                existing_flags.add(alias)
+        # Also include already user-added flags
+        user_opts = self.user_option_store.load()
+        for entry in user_opts.options:
+            existing_flags.add(entry.flag)
+
+        dialog = _OptionPickerDialog(
+            schema=self._schema,
+            existing_flags=existing_flags,
+            user_option_store=self.user_option_store,
+            parent=self,
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            # Capture current values before rebuild
+            saved_settings, saved_raw_args, saved_user_set = self._settings_from_form()
+            # Rebuild UI
+            self._main_settings_card.setParent(None)
+            self._main_settings_card.deleteLater()
+            self._build_main_settings()
+            self._advanced_card.setParent(None)
+            self._advanced_card.deleteLater()
+            self._build_advanced_groups()
+            # Restore values from captured state
+            self._restore_form_values(saved_settings, saved_raw_args, saved_user_set)
+            self._update_command_preview()
+
+    def _restore_form_values(
+        self,
+        settings: "SettingValueMap",
+        raw_args: list[str],
+        user_set: set[str],
+    ) -> None:
+        """Restore editor values after a UI rebuild."""
+        # Build a temporary profile to use _load_profile_into_form logic
+        model = self._selected_model()
+        profile = self._selected_profile()
+        temp_profile = ModelProfile(
+            id=profile.id if profile else "__ephemeral__",
+            model_id=profile.model_id if profile and model else (model.id if model else ""),
+            name=profile.name if profile else "Unsaved",
+            settings=settings,
+            raw_args=raw_args,
+            user_set=user_set,
+            is_default=profile.is_default if profile else False,
+        )
+        for option_id, widget in self._editors.items():
+            catalog_opt = LLAMA_OPTION_CATALOG.get(option_id)
+            if catalog_opt is not None:
+                value = settings.get(option_id)
+                if value is not None:
+                    self._set_editor_value(catalog_opt, widget, value.to_json())
+            else:
+                self._load_unknown_editor(option_id, widget, temp_profile)
+        self._refresh_option_cards()
+
+    def _make_user_option_remove_button(self, flag: str, parent: QWidget) -> QPushButton:
+        """Create a small × button to remove a user-added option."""
+        btn = QPushButton("\u00d7", parent)
+        btn.setObjectName("UserOptionRemoveBtn")
+        btn.setFixedSize(20, 20)
+        btn.setToolTip(f"Remove {flag} from the UI")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.clicked.connect(lambda checked=False, f=flag: self._remove_user_option(f))
+        return btn
+
+    def _remove_user_option(self, flag: str) -> None:
+        """Remove a user-added option and rebuild the UI."""
+        reply = QMessageBox.question(
+            self,
+            "Remove option",
+            f"Remove {flag} from the UI?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        user_opts = self.user_option_store.load()
+        user_opts.remove(flag)
+        self.user_option_store.save(user_opts)
+        # Capture and rebuild
+        saved_settings, saved_raw_args, saved_user_set = self._settings_from_form()
+        self._main_settings_card.setParent(None)
+        self._main_settings_card.deleteLater()
+        self._build_main_settings()
+        self._advanced_card.setParent(None)
+        self._advanced_card.deleteLater()
+        self._build_advanced_groups()
+        self._restore_form_values(saved_settings, saved_raw_args, saved_user_set)
+        self._update_command_preview()
+
+    def _user_added_options_for_destination(self, destination: str) -> list[RuntimeOption]:
+        """Return RuntimeOptions for user-added entries matching a destination."""
+        user_opts = self.user_option_store.load()
+        result = []
+        for entry in user_opts.options:
+            if entry.destination != destination:
+                continue
+            rt_opt = self._schema_options_by_id.get(entry.flag)
+            if rt_opt is None:
+                # Try to find by flag in schema
+                for opt in (self._schema.options if self._schema else []):
+                    if opt.flag == entry.flag:
+                        rt_opt = opt
+                        # Register for future use
+                        self._schema_options_by_id[opt.id] = opt
+                        break
+            if rt_opt is not None:
+                result.append(rt_opt)
+            else:
+                # Create a minimal RuntimeOption for unsupported flags
+                result.append(RuntimeOption(
+                    id=f"user:{entry.flag}",
+                    flag=entry.flag,
+                    flags=[entry.flag],
+                    label=entry.flag,
+                    group="advanced",
+                    kind="string",
+                    description="",
+                    supported=False,
+                    curated=False,
+                ))
+        return result
 
     # ------------------------------------------------------------------
     # Mode / router panel

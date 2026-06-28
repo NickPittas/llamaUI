@@ -16,10 +16,10 @@ from .llama_options import (
     clean_raw_args,
     default_settings_from_catalog,
 )
-from .models import AppConfig, HfTokenSource, LocalModel, ModelProfile
+from .models import AppConfig, HfTokenSource, LocalModel, ModelProfile, UserOptionEntry, UserOptions
 from .paths import DataPaths, default_data_dir, default_paths
 from .storage import CURRENT_SCHEMA_VERSION, Migration, VersionedEnvelope, load_envelope, save_envelope
-from .stores import ConfigStore, LibraryStore, ProfileStore
+from .stores import ConfigStore, LibraryStore, ProfileStore, UserOptionStore
 
 __all__ = [
     "CURRENT_SCHEMA_VERSION",
@@ -50,4 +50,7 @@ __all__ = [
     "LibraryStore",
     "ModelProfile",
     "ProfileStore",
+    "UserOptionEntry",
+    "UserOptions",
+    "UserOptionStore",
 ]
